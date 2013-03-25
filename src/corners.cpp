@@ -3,6 +3,7 @@
 #include "cv.h"
 #include "highgui.h"
 #include "mutex.cpp"
+#include "graphics.cpp"
 #include <math.h>
 #include <sstream>
 
@@ -12,9 +13,14 @@
 #define DEBUGMESS(X)
 #endif
 
-
 // global variables
-Mutex * _mutex_frame;
+double * smooth_kernel;
+unsigned int smooth_kernel_size;
+double sigma;
+
+double * edge_kernel;
+unsigned int edge_kernel_rows;
+unsigned int edge_kernel_cols;
 
 class Fence:private Mutex{
   // private variables
@@ -54,6 +60,18 @@ struct callbackParams{
 
 // useful methods
 
+// MAX
+template<class T> T max(T el1, T el2){
+  if(el1 < el2) return el2;
+  return el1;
+}
+
+// MIN
+template<class T> T min(T el1, T el2){
+  if(el1 < el2) return el1;
+  return el2;
+}
+
 // STRINGIFY
 template<class T> std::string stringify(T value) {
   std::ostringstream o;
@@ -65,8 +83,8 @@ template<class T> std::string stringify(T value) {
 // CHECKINSIDE
 // checks whether a point is inside the image or not
 template<class T> bool checkInside(T x, T y, cv::Mat * image){
-  if(x > image->cols) return false;
-  if(y > image->rows) return false;
+  if(x >= image->cols) return false;
+  if(y >= image->rows) return false;
   if(x < 0) return false;
   if(y < 0) return false;
   return true;
@@ -77,7 +95,6 @@ template<class T> bool checkInside(T x, T y, cv::Mat * image){
 
 void Fence::_init(){
   _alpha_size = _radius[1] - _radius[0];
-  _alpha = new double[_alpha_size];
   _setResolution(2 * M_PI * _radius[1]);
   this->_computeFrontier();
   this->_computeAlpha();
@@ -125,6 +142,7 @@ void Fence::_computeFrontier(){
 
 
 void Fence::_computeAlpha(){
+  DEBUGMESS("computing alpha");
   _alpha_size = _radius[1] - _radius[0];
   DEBUGMESS(std::string("alpha size: ").append(stringify(_alpha_size)));
   _alpha = new double[_alpha_size];
@@ -136,14 +154,17 @@ void Fence::_computeAlpha(){
 
 
 void Fence::_recomputeStuff(){
-  //delete[] _alpha;
-  //delete[] _frontier;
-  _computeAlpha();
+  DEBUGMESS("delete frontier");
+  delete[] _frontier;
+  DEBUGMESS("delete alpha");
+  delete[] _alpha;
   _computeFrontier();
+  _computeAlpha();
 }
 
 
 void Fence::setCenter(int x, int y){
+  DEBUGMESS(std::string("set center: ").append(stringify(x)).append(" ").append(stringify(y)));
   this->lock();
   _center[0] = x;
   _center[1] = y;
@@ -161,7 +182,7 @@ void Fence::_setResolution(double res){
 void Fence::scaleInternalRadius(double amount){
   this->lock();
   double newsize = _radius[0] * amount;
-  if(newsize>_radius[1]){
+  if(newsize>_radius[1]-1){
     this->unlock();
     return;
   }
@@ -171,9 +192,10 @@ void Fence::scaleInternalRadius(double amount){
 }
 
 void Fence::scaleExternalRadius(double amount){
+  
   this->lock();
   double newsize = _radius[1] * amount;
-  if(newsize < _radius[0]){
+  if(newsize < _radius[0]+1){
     this->unlock();
     return;
   }
@@ -207,7 +229,7 @@ cv::Mat * Fence::unrollImage(cv::Mat * image){
 
 
 // another method for unrolling an image
-// this should be slower
+// this should be slower.
 cv::Mat * Fence::unrollImage2(cv::Mat * image){
   this->lock();
   cv::Mat * unrolled = new cv::Mat(_alpha_size, _frontier_resolution, CV_8UC3, cv::Scalar(0,0,0));
@@ -247,11 +269,11 @@ void Fence::paintFence(cv::Mat * image){
   
   cv::Vec3b red((uchar)0,(uchar)0,(uchar)255);
   
+  DEBUGMESS("drawing central cross");
   // draw a cross in the center
   
   // if the center of the fence is inside the image
   if(checkInside(_center[0], _center[1], image)){
-    
     
     // draw a cross
     for (int i = -rows/20; i<=rows/20; i++){
@@ -269,6 +291,7 @@ void Fence::paintFence(cv::Mat * image){
     DEBUGMESS(std::string("center of the fence is outside the image: ").append(stringify(_center[0])).append(" ").append(stringify(_center[1])));
   }
   
+  DEBUGMESS("drawing circles");
   // draw circles
   for(unsigned int i=0; i<_frontier_resolution; i++){
     unsigned int index = i*4;
@@ -280,6 +303,7 @@ void Fence::paintFence(cv::Mat * image){
     }
   }
   
+  DEBUGMESS("drawing lines");
   // draw lines at 0 and at pi/2 angles
   int x;
   int y;
@@ -322,8 +346,66 @@ void mouseCallBack(int event_type, int x, int y, int flags, void * param){
 }
 
 
+// SETSMOOTHFILTER
+// size MUST be odd
+void setSmoothFilter(unsigned int size){
+  // smooth_kernel_size = size;
+  // unsigned int elements = size * size;
+  
+  // smooth_kernel = new double[elements];
+  
+  // for(unsigned int i=0; i<elements; i++){
+  //   smooth_kernel[i] = (double)1/elements;
+  // }
+  
+  int center = (size % 2);
+  double total = 0;
+  smooth_kernel_size = size;
+  smooth_kernel = new double[size*size];
+  for(int i=0; i<(int)size; i++){
+    for(int j=0; j<(int)size; j++){
+      double dx = abs(i-center);
+      double dy = abs(j-center); 
+      smooth_kernel[i*size + j] = exp(-(dx*dx + dy*dy) / (2.0 * sigma * sigma)) / sqrt(2.0 * M_PI * sigma * sigma);
+      total += smooth_kernel[i*size + j];
+    }
+  }
+  
+  // normalize the weights
+  // and print the new filter
+  double check = 0;
+  std::cout << "smoothing filter:" << std::endl;
+  for(unsigned int i=0; i<smooth_kernel_size; i++){
+    std::cout << "|";
+    for(unsigned int j=0; j<smooth_kernel_size; j++){
+      smooth_kernel[i*smooth_kernel_size + j] = (smooth_kernel[i*smooth_kernel_size + j])/total;
+      std::cout << " " << smooth_kernel[i*smooth_kernel_size + j];
+    }
+    std::cout << " |" << std::endl;
+  }
+}
+
+
 void init(){
-  _mutex_frame = new Mutex();
+  // set the smooth filter
+  sigma = 2;
+  setSmoothFilter(3);
+  for(unsigned int i=0; i<smooth_kernel_size; i++){
+    for(unsigned int j=0; j<smooth_kernel_size; j++){
+      
+    }
+    std::cout << std::endl;
+  }
+  
+  // set the edge filter
+  edge_kernel_rows = 1;
+  edge_kernel_cols = 3;
+  edge_kernel = new double[3];
+  for(unsigned int i=0; i<edge_kernel_cols * edge_kernel_rows; i = i+3){
+    edge_kernel[i] = -1;
+    edge_kernel[i+1] = 0;
+    edge_kernel[i+2] = 1;
+  }
 }
 
 // main method
@@ -347,16 +429,31 @@ int main(int argc, char ** argv){
   // prepare for streaming
   const char * main_image_window_name = "streaming";
   const char * unrolled_window_name = "unrolled";
+  const char * grayscaled_window_name = "grayscaled";
+  const char * blurred_window_name = "blurred";
+  const char * edges_window_name = "edges";
+  const char * canny_window_name = "cannyfied";
   
   int frame_number = 0;
   IplImage * frame;
   cv::Mat * image;
   cv::Mat * unrolled;
+  cv::Mat * blurred;
+  cv::Mat * edges;
+  cv::Mat * cannyfied;
   
   cvNamedWindow(main_image_window_name, CV_WINDOW_NORMAL);
   cv::moveWindow(main_image_window_name, 100, 100);
   cvNamedWindow(unrolled_window_name, CV_WINDOW_NORMAL);
   cv::moveWindow(unrolled_window_name, 500, 100);
+  cvNamedWindow(grayscaled_window_name, CV_WINDOW_NORMAL);
+  cv::moveWindow(grayscaled_window_name, 550, 150);
+  cvNamedWindow(blurred_window_name, CV_WINDOW_NORMAL);
+  cv::moveWindow(blurred_window_name, 600, 200);
+  cvNamedWindow(edges_window_name, CV_WINDOW_NORMAL);
+  cv::moveWindow(edges_window_name, 750, 100);
+  cvNamedWindow(canny_window_name, CV_WINDOW_NORMAL);
+  cv::moveWindow(canny_window_name, 800, 150);
   
   cvStartWindowThread;
   
@@ -371,7 +468,7 @@ int main(int argc, char ** argv){
   image = new cv::Mat(frame);
   
   // create the fence
-  Fence fence(image->cols/2,image->rows/2,10,30);
+  Fence fence(image->cols/2,image->rows/2,65,210);
   
   callbackParams params;
   params.image = image;
@@ -395,34 +492,82 @@ int main(int argc, char ** argv){
       else if(key=='k'){
 	fence.scaleInternalRadius(0.9);
       }
+      else if(key=='s'){
+	delete smooth_kernel;
+	setSmoothFilter(smooth_kernel_size + 2);
+      }
+      else if(key=='a'){
+	delete smooth_kernel;
+	unsigned int newsize = max(1,(int)smooth_kernel_size - 2);
+	setSmoothFilter(newsize);
+      }
+      else if(key=='x'){
+	sigma = sigma + 0.2;
+	std::cout << "new sigma: " << sigma << std::endl;
+	delete smooth_kernel;
+	setSmoothFilter(smooth_kernel_size);
+      }
+      else if(key=='z'){
+	sigma = max(0.2, sigma - 0.2);
+	std::cout << "new sigma: " << sigma << std::endl;
+	delete smooth_kernel;
+	setSmoothFilter(smooth_kernel_size);
+      }
       else{
 	std::cout << "key pressed: " << key << std::endl;
       }
     }
     
+    DEBUGMESS("grabbing frame number");
     frame_number = cvGrabFrame(capture);
     
-    _mutex_frame->lock();
+    DEBUGMESS("grabbing frame");
     frame = cvRetrieveFrame(capture,frame_number);
-    _mutex_frame->unlock();
+    
     if(!frame){
       fprintf(stderr,"ERROR: frame is null.. \n");
       getchar();
       continue;
     }
     
+    DEBUGMESS("unrolling image");
     unrolled = fence.unrollImage(image);
     
+    DEBUGMESS("getting grayscaled image");
+    cv::Mat grayscaled;
+    cv::cvtColor(*unrolled, grayscaled, CV_RGB2GRAY);
+    
+    DEBUGMESS("getting blurred image");
+    blurred = applyFilter(&grayscaled, smooth_kernel, smooth_kernel_size);
+    
+    DEBUGMESS("applying derivative filter");
+    edges = applyFilter(blurred, edge_kernel, edge_kernel_rows, edge_kernel_cols);
+    
+    DEBUGMESS("applying canny operator");
+    cannyfied = canny(edges, 100,50);
+    
+    DEBUGMESS("drawing fence");
     fence.paintFence(image);
+    
+    DEBUGMESS("showing images");
     cv::imshow(main_image_window_name, *image);
     cv::imshow(unrolled_window_name, *unrolled);
+    cv::imshow(grayscaled_window_name, grayscaled);
+    cv::imshow(blurred_window_name, *blurred);
+    cv::imshow(edges_window_name, *edges);
+    cv::imshow(canny_window_name, *cannyfied);
     
+    DEBUGMESS("deleting images");
+    delete unrolled;
+    delete blurred;
+    delete edges;
+    delete cannyfied;
     
-    //delete image;
+    DEBUGMESS("read key...");
     key = (char) cv::waitKey(20); // non blocking, returns -1 if nothing was pressed
   }
     
-  cvReleaseCapture(&capture);
+  // cvReleaseCapture(&capture);
   cvDestroyWindow(main_image_window_name);
   
   delete image;
